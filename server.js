@@ -1872,6 +1872,68 @@ app.post('/canvas-noise', async (req, res) => {
   }
 });
 
+// ── 工具与维护 ──
+
+// 清除缓存
+app.post('/cache/clear', async (req, res) => {
+  try {
+    if (!browser) return res.json({ ok: true, cleared: false, note: '浏览器未启动' });
+    const client = await pages.values().next().value?.page?.target()?.createCDPSession();
+    if (client) {
+      await client.send('Network.clearBrowserCache');
+      await client.send('Network.clearBrowserCookies');
+    }
+    res.json({ ok: true, cleared: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// 动态设 viewport
+app.post('/viewport', async (req, res) => {
+  try {
+    await ensureBrowser();
+    const { pid, entry } = getPageEntry(req);
+    if (!entry) return res.status(404).json({ ok: false, error: '页面不存在' });
+    const { width, height, deviceScaleFactor, isMobile, hasTouch } = req.body;
+    await entry.page.setViewport({
+      width: width || 412,
+      height: height || 915,
+      deviceScaleFactor: deviceScaleFactor || 1,
+      isMobile: isMobile !== false,
+      hasTouch: hasTouch !== false,
+    });
+    res.json({ ok: true, pageId: pid, viewport: { width, height, deviceScaleFactor, isMobile, hasTouch } });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// 快速获取当前 URL
+app.post('/url', async (req, res) => {
+  try {
+    await ensureBrowser();
+    const { pid, entry } = getPageEntry(req);
+    if (!entry) return res.status(404).json({ ok: false, error: '页面不存在' });
+    res.json({ ok: true, pageId: pid, url: entry.page.url() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// 页面元素存在性检查
+app.post('/exists', async (req, res) => {
+  try {
+    await ensureBrowser();
+    const { pid, entry } = getPageEntry(req);
+    if (!entry) return res.status(404).json({ ok: false, error: '页面不存在' });
+    const el = await entry.page.$(req.body.selector);
+    res.json({ ok: true, pageId: pid, selector: req.body.selector, exists: !!el });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── 状态 ──
 app.get('/status', async (req, res) => {
   res.json({
