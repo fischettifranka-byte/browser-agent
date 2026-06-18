@@ -1,0 +1,39 @@
+{
+  "name": "browser-agent",
+  "version": "1.0.0",
+  "description": "🔍 AI 手机浏览器操控工具 — HTTP API 驱动 headless Chromium，给 AI Agent 用的 Puppeteer 替代品",
+  "main": "server.js",
+  "bin": {
+    "browser-agent": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "bash test.sh"
+  },
+  "keywords": [
+    "browser",
+    "automation",
+    "puppeteer",
+    "chromium",
+    "headless",
+    "ai-agent",
+    "termux",
+    "android",
+    "scraping",
+    "anti-detection"
+  ],
+  "author": "栖月 & 清绾",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fischettifranka-byte/browser-agent"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "puppeteer-core": "^25.1.0"
+  }
+}
