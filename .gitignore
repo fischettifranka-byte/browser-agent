@@ -1,0 +1,8 @@
+node_modules/
+chrome-profile/
+screenshots/*.png
+downloads/*
+*.log
+.env
+.DS_Store
+cron-jobs.json
