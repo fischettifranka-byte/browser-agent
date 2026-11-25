@@ -33,7 +33,10 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@mozilla/readability": "^0.6.0",
     "express": "^5.2.1",
-    "puppeteer-core": "^25.1.0"
+    "jsdom": "^31.0.1",
+    "puppeteer-core": "^25.1.0",
+    "turndown": "^7.2.5"
   }
 }

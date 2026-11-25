@@ -17,7 +17,7 @@ const PORT = 9223;
 const MAX_PAGES = 8;               // 标签页上限，超出关最旧
 const AUTH_TOKEN = process.env.BA_TOKEN || null;   // 可选鉴权: 启动时设 BA_TOKEN=xxx
 const QWEN_API_KEY = process.env.QWEN_API_KEY || null;  // 阿里云 DashScope key(验证码识别用)
-const CHROMIUM_PATH = '/data/data/com.termux/files/usr/bin/chromium-browser';
+const CHROMIUM_PATH = '/usr/bin/google-chrome-stable';
 const USER_DATA = path.join(__dirname, 'chrome-profile');
 const DOWNLOADS = path.join(__dirname, 'downloads');
 const SCREENSHOTS = path.join(__dirname, 'screenshots');
@@ -92,6 +92,9 @@ async function ensureBrowser() {
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
     '--disable-gpu',
+    '--disable-blink-features=AutomationControlled',
+    '--lang=en-US',
+    '--window-size=1280,720',
     `--user-data-dir=${USER_DATA}`,
   ];
   
@@ -102,7 +105,7 @@ async function ensureBrowser() {
   
   browser = await puppeteer.launch({
     executablePath: CHROMIUM_PATH,
-    headless: true,
+    headless: false,
     args: launchArgs,
     acceptInsecureCerts: true,
   });
@@ -118,6 +121,13 @@ async function ensureBrowser() {
   const existingPages = await browser.pages();
   if (existingPages.length > 0) {
     const p = existingPages[0];
+    // 恢复路径补齐与 newPage 一致的默认设置（UA/视口/下载行为），否则重启后默认页会掉回系统默认 UA
+    try {
+      await p.setViewport({ width: 1536, height: 864 });
+      await p.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.8127.88 Safari/537.36');
+      const restoreClient = await p.target().createCDPSession();
+      await restoreClient.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: DOWNLOADS });
+    } catch (e) { console.log('⚠️ 恢复页面默认设置失败:', e.message); }
     const id = String(++pageCounter);
     pages.set(id, { page: p, title: await p.title(), url: p.url(), createdAt: Date.now() });
   } else {
@@ -138,7 +148,8 @@ async function newPage() {
     }
   }
   const p = await browser.newPage();
-  await p.setViewport({ width: 412, height: 915 });
+  await p.setViewport({ width: 1536, height: 864 });
+  await p.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.8127.88 Safari/537.36');
   
   // 配置下载行为
   const client = await p.target().createCDPSession();
@@ -427,6 +438,185 @@ app.post('/info', async (req, res) => {
   }
 });
 
+// ── 爬取: 单页 /scrape + 整站 /crawl ──
+// 依赖 jsdom + @mozilla/readability + turndown, 懒加载: 缺依赖只影响爬取接口, 不拖垮主服务
+let _scrapeDeps = null;
+function scrapeDeps() {
+  if (_scrapeDeps) return _scrapeDeps;
+  const { JSDOM } = require('jsdom');
+  const { Readability } = require('@mozilla/readability');
+  const TurndownService = require('turndown');
+  _scrapeDeps = { JSDOM, Readability, TurndownService };
+  return _scrapeDeps;
+}
+
+// 在已打开的页面上提取正文与链接 (scrape 与 crawl 共用)
+async function extractFromOpenPage(entry, wantScreenshot) {
+  const page = entry.page;
+  const url = page.url();
+  const title = await page.title();
+  const html = await page.content();
+  const links = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)).catch(() => []);
+  let markdown = '', text = '', excerpt = '';
+  try {
+    const { JSDOM, Readability, TurndownService } = scrapeDeps();
+    const dom = new JSDOM(html, { url });
+    const article = new Readability(dom.window.document).parse();
+    if (article && article.textContent && article.textContent.trim().length >= 100) {
+      text = article.textContent.trim().replace(/\n{3,}/g, '\n\n');
+      excerpt = article.excerpt || '';
+      const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
+      markdown = td.turndown(article.content || '');
+    }
+  } catch (e) {
+    console.error('📄 Readability 提取失败, 回退纯文本:', e.message);
+  }
+  if (!text) {
+    // 回退: 整页可见文本 (可能含导航噪音, 但保证有结果)
+    text = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+    text = (text || '').trim();
+    markdown = text;
+    excerpt = text.slice(0, 200);
+  }
+  const out = { url, title, markdown, text, excerpt, length: text.length, links };
+  if (wantScreenshot) {
+    const filename = `scrape_${Date.now()}.png`;
+    await page.screenshot({ path: path.join(SCREENSHOTS, filename) }).catch(() => {});
+    out.screenshot = `/screenshots/${filename}`;
+  }
+  return out;
+}
+
+// 打开 URL 并提取 (自带临时标签页, 用完关闭, 不干扰用户页面)
+async function scrapeUrl(url, { waitMs = 2000, screenshot = false } = {}) {
+  await ensureBrowser();
+  const pid = await newPage();
+  const entry = pages.get(pid);
+  try {
+    return await pageQueue(entry, async () => {
+      await entry.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await entry.page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(() => {});
+      if (waitMs) await new Promise(r => setTimeout(r, waitMs));
+      return await extractFromOpenPage(entry, screenshot);
+    });
+  } finally {
+    pages.delete(pid);
+    try { await entry.page.close(); } catch (e) {}
+  }
+}
+
+// 单页爬取: 给网址, 返回干净 Markdown 正文
+app.post('/scrape', async (req, res) => {
+  try {
+    const { url, waitMs = 2000, screenshot = false } = req.body || {};
+    if (!url) return res.status(400).json({ ok: false, error: '缺少 url' });
+    const data = await scrapeUrl(url, { waitMs, screenshot: !!screenshot });
+    const { links, ...out } = data;
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── 整站爬取: BFS 同域名, 后台任务 ──
+const crawlJobs = new Map(); // id → job
+let crawlCounter = 0;
+const CRAWL_SKIP_EXT = /\.(jpe?g|png|gif|svg|webp|ico|css|js|mjs|map|pdf|zip|rar|7z|tar|gz|mp4|mp3|wav|avi|mov|woff2?|ttf|eot|xml|rss|atom)(\?|#|$)/i;
+
+function normalizeCrawlUrl(raw, baseHost) {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    if (u.hostname !== baseHost) return null;
+    if (CRAWL_SKIP_EXT.test(u.pathname + u.search)) return null;
+    u.hash = '';
+    return u.toString();
+  } catch (e) { return null; }
+}
+
+async function runCrawl(job) {
+  await ensureBrowser();
+  const pid = await newPage();
+  const entry = pages.get(pid);
+  job.pageId = pid;
+  try {
+    while (job.queue.length > 0) {
+      if (job.pages.length >= job.maxPages) break;
+      const { url, depth } = job.queue.shift();
+      if (job.visited.has(url)) continue;
+      job.visited.add(url);
+      try {
+        const data = await Promise.race([
+          pageQueue(entry, async () => {
+            await entry.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await entry.page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(() => {});
+            if (job.waitMs) await new Promise(r => setTimeout(r, job.waitMs));
+            return await extractFromOpenPage(entry, false);
+          }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('单页超时 70s')), 70000)),
+        ]);
+        job.pages.push({ url: data.url, title: data.title, markdown: data.markdown });
+        if (depth < job.maxDepth) {
+          for (const link of data.links || []) {
+            const n = normalizeCrawlUrl(link, job.host);
+            if (n && !job.visited.has(n) && !job.queue.some(q => q.url === n)) {
+              job.queue.push({ url: n, depth: depth + 1 });
+            }
+          }
+        }
+      } catch (e) {
+        job.errors.push({ url, error: e.message });
+      }
+      job.done = job.pages.length + job.errors.length;
+    }
+    job.state = 'done';
+  } catch (e) {
+    job.state = 'error';
+    job.errors.push({ url: job.startUrl, error: e.message });
+  } finally {
+    pages.delete(pid);
+    try { await entry.page.close(); } catch (e) {}
+    console.log(`🕷️ 爬取任务 ${job.id} 结束: ${job.pages.length} 页, ${job.errors.length} 错误`);
+  }
+}
+
+app.post('/crawl', async (req, res) => {
+  try {
+    const { url, maxDepth = 2, maxPages = 20, waitMs = 0 } = req.body || {};
+    if (!url) return res.status(400).json({ ok: false, error: '缺少 url' });
+    const running = [...crawlJobs.values()].filter(j => j.state === 'running').length;
+    if (running >= 2) return res.status(429).json({ ok: false, error: '已有 2 个爬取任务在跑, 稍后再试' });
+    const start = new URL(url);
+    const id = String(++crawlCounter);
+    const job = {
+      id, state: 'running', startUrl: url, host: start.hostname,
+      maxDepth: Math.max(0, Math.min(5, maxDepth | 0)),
+      maxPages: Math.max(1, Math.min(50, maxPages | 0)),
+      waitMs, queue: [{ url: start.toString(), depth: 0 }], visited: new Set(),
+      pages: [], errors: [], done: 0, createdAt: Date.now(),
+    };
+    crawlJobs.set(id, job);
+    if (crawlJobs.size > 20) { // 只保留最近 20 个任务记录
+      for (const [k, j] of crawlJobs) { if (crawlJobs.size <= 20) break; if (j.state !== 'running') crawlJobs.delete(k); }
+    }
+    runCrawl(job).catch(e => console.error('🕷️ 爬取任务异常:', e.message));
+    res.json({ ok: true, jobId: id, state: job.state, maxPages: job.maxPages, maxDepth: job.maxDepth });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/crawl/status', (req, res) => {
+  const job = crawlJobs.get(String(req.query.id || ''));
+  if (!job) return res.status(404).json({ ok: false, error: '任务不存在' });
+  res.json({
+    ok: true, id: job.id, state: job.state,
+    done: job.done, total: job.maxPages, queued: job.queue.length,
+    startUrl: job.startUrl,
+    pages: job.pages, errors: job.errors,
+  });
+});
+
 // ── 多页面管理 ──
 
 // 新建标签页
@@ -518,8 +708,16 @@ app.post('/submit', async (req, res) => {
     const { pid, entry } = getPageEntry(req);
     if (!entry) return res.status(404).json({ ok: false, error: '页面不存在' });
     const { selector } = req.body;
-    await entry.page.$eval(selector, el => el.form ? el.form.submit() : el.closest('form')?.submit());
-    await new Promise(r => setTimeout(r, req.body?.waitMs || 2000));
+    try {
+      await entry.page.$eval(selector, el => el.form ? el.form.submit() : el.closest('form')?.submit());
+    } catch (e) {
+      // 提交触发整页跳转时 $eval 的执行上下文会被销毁；动作本身已生效，忽略该错误
+      if (!/Execution context was destroyed/i.test(e.message)) throw e;
+    }
+    await Promise.race([
+      entry.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: (req.body?.waitMs || 2000) + 5000 }).catch(() => null),
+      new Promise(r => setTimeout(r, req.body?.waitMs || 2000)),
+    ]);
     res.json({ ok: true, pageId: pid, url: entry.page.url() });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -1236,7 +1434,7 @@ app.post('/watch', async (req, res) => {
     const changes = [];
     domWatchers.set(pid, { changes });
     
-    await entry.page.evaluate((sel) => {
+    await entry.page.evaluate((sel, attrs) => {
       const target = sel ? document.querySelector(sel) : document.body;
       if (!target) return;
       const observer = new MutationObserver((mutations) => {
@@ -1251,9 +1449,9 @@ app.post('/watch', async (req, res) => {
           });
         }
       });
-      observer.observe(target, { childList: true, subtree: true, attributes: req.body?.attributes !== false });
+      observer.observe(target, { childList: true, subtree: true, attributes: attrs });
       window.__domObserver = observer;
-    }, selector || null);
+    }, selector || null, req.body?.attributes !== false);
     
     const waitMs = timeout || 5000;
     await new Promise(r => setTimeout(r, waitMs));
@@ -1300,12 +1498,22 @@ app.post('/paginate', async (req, res) => {
     for (let i = 0; i < max; i++) {
       // 提取当前页内容
       if (contentSelector) {
-        const items = await entry.page.evaluate((sel) => {
-          return Array.from(document.querySelectorAll(sel)).map(el => ({
-            text: el.innerText?.slice(0, 500),
-            html: el.innerHTML?.slice(0, 1000),
-          }));
-        }, contentSelector);
+        let items = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            items = await entry.page.evaluate((sel) => {
+              return Array.from(document.querySelectorAll(sel)).map(el => ({
+                text: el.innerText?.slice(0, 500),
+                html: el.innerHTML?.slice(0, 1000),
+              }));
+            }, contentSelector);
+            break;
+          } catch (e) {
+            // 整页跳转会销毁执行上下文，等页面落地后重试提取
+            if (!/Execution context was destroyed/i.test(e.message) || attempt === 2) throw e;
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        }
         pages_data.push({ page: i + 1, url: entry.page.url(), items });
       } else {
         pages_data.push({ page: i + 1, url: entry.page.url() });
@@ -1318,8 +1526,11 @@ app.post('/paginate', async (req, res) => {
         const isDisabled = await entry.page.evaluate(el => el.disabled || el.classList.contains('disabled') || el.getAttribute('aria-disabled') === 'true', nextBtn);
         if (isDisabled) break;
         
+        // 先挂导航等待再点击：整页跳转等导航落地，SPA 翻页用 wait 兜底
+        const navPromise = entry.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => null);
         await nextBtn.click();
-        await new Promise(r => setTimeout(r, wait));
+        await Promise.race([navPromise, new Promise(r => setTimeout(r, wait))]);
+        await new Promise(r => setTimeout(r, 500));
       } else {
         break;
       }
@@ -1603,14 +1814,18 @@ app.post('/batch', async (req, res) => {
         const fetchUrl = `${BATCH_HOST}/${op.endpoint.replace(/^\//, '')}`;
         const opts = {
           method: op.method || 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            // 内部子调用必须带上调用方的鉴权头，否则全部被鉴权中间件挡下
+            ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
+          },
         };
         if (op.body && opts.method !== 'GET') {
           opts.body = JSON.stringify(op.body);
         }
         const resp = await fetch(fetchUrl, opts);
-        const data = await resp.json();
-        results.push({ endpoint: op.endpoint, ok: true, data });
+        const data = await resp.json().catch(() => null);
+        results.push({ endpoint: op.endpoint, ok: resp.ok && data?.ok !== false, status: resp.status, data });
       } catch (e) {
         results.push({ endpoint: op.endpoint, ok: false, error: e.message });
       }
@@ -1636,7 +1851,7 @@ app.post('/test-selector', async (req, res) => {
         tagNames: Array.from(els).slice(0, 10).map(e => e.tagName.toLowerCase()),
         texts: Array.from(els).slice(0, 10).map(e => e.innerText?.slice(0, 100)),
         ids: Array.from(els).slice(0, 10).map(e => e.id || '').filter(Boolean),
-        classes: Array.from(els).slice(0, 10).map(e => e.className?.slice(0, 100) || ''),
+        classes: Array.from(els).slice(0, 10).map(e => (typeof e.className === 'string' ? e.className : (e.className?.baseVal || '')).slice(0, 100)),
       };
     }, selector);
     res.json({ ok: true, pageId: pid, selector, ...result });
@@ -1715,7 +1930,7 @@ app.post('/structure', async (req, res) => {
         return {
           tag,
           id: el.id || undefined,
-          class: el.className?.slice(0, 100) || undefined,
+          class: (typeof el.className === 'string' ? el.className : (el.className?.baseVal || '')).slice(0, 100) || undefined,
           text: el.children.length === 0 ? el.innerText?.slice(0, 80) : undefined,
           count: tag === 'a' || tag === 'li' || tag === 'tr' ? 1 : undefined,
           children: children.length > 0 ? children.slice(0, 20) : undefined,
@@ -2256,6 +2471,85 @@ app.post('/ocr', async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// ── 接管模式: 自动化过不去(登录/验证码)时, 拉起 x11vnc + websockify(noVNC), 给用户一个可点的链接 ──
+const { spawn: tkSpawn, execFileSync: tkExecFileSync } = require("child_process");
+const tkCrypto = require("crypto");
+const TAKEOVER_TTL_MS = 15 * 60 * 1000;
+const VNC_PASS_FILE = path.join(__dirname, ".takeover-rfbauth");
+const NOVNC_WEB_DIR = "/data/apps/novnc";
+const TK_DISPLAY = process.env.DISPLAY || ":98";
+let takeover = null; // { expiresAt, timer, procs: [] }
+
+let takeoverStopping = false;
+function stopTakeover() {
+  if (!takeover) return false;
+  takeoverStopping = true;
+  clearTimeout(takeover.timer);
+  for (const p of takeover.procs) { try { p.kill("SIGTERM"); } catch (_) {} }
+  takeover = null;
+  try { fs.unlinkSync(VNC_PASS_FILE); } catch (_) {}
+  return true;
+}
+
+
+async function waitProcsExit(procs, ms) {
+  const t0 = Date.now();
+  while (procs.some((p) => p.exitCode === null && p.signalCode === null) && Date.now() - t0 < ms) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  for (const p of procs) {
+    if (p.exitCode === null && p.signalCode === null) { try { p.kill("SIGKILL"); } catch (_) {} }
+  }
+}
+
+app.post("/takeover/start", async (req, res) => {
+  try {
+    const oldProcs = takeover ? takeover.procs : []; // 幂等: 重复 start 先清掉旧进程, 并等它真正退出再启新的, 否则撞端口秒退
+    stopTakeover();
+    await waitProcsExit(oldProcs, 4000);
+    for (let i = 0; i < 10; i++) {
+      let busy = "";
+      try { busy = tkExecFileSync("/bin/sh", ["-c", "ss -tln | grep -E ':(5900|6080)[[:space:]]' || true"]).toString().trim(); } catch (_) {}
+      if (!busy) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    takeoverStopping = false;
+    const password = tkCrypto.randomBytes(4).toString("hex"); // 8 位, VNC 口令上限即 8 字符
+    tkExecFileSync("/usr/bin/x11vnc", ["-storepasswd", password, VNC_PASS_FILE], { stdio: "pipe" });
+    fs.chmodSync(VNC_PASS_FILE, 0o600);
+    const vncFd = fs.openSync("/data/apps/browser-agent/takeover-vnc.log", "a");
+    const vnc = tkSpawn("/usr/bin/x11vnc", ["-display", TK_DISPLAY, "-rfbport", "5900", "-localhost", "-rfbauth", VNC_PASS_FILE, "-forever", "-shared", "-noxdamage"], { stdio: ["ignore", vncFd, vncFd] });
+    const wsFd = fs.openSync("/data/apps/browser-agent/takeover-ws.log", "a");
+    const ws = tkSpawn("/usr/bin/websockify", ["--web", NOVNC_WEB_DIR, "127.0.0.1:6080", "127.0.0.1:5900"], { stdio: ["ignore", wsFd, wsFd] });
+    const expiresAt = Date.now() + TAKEOVER_TTL_MS;
+    takeover = { expiresAt, timer: setTimeout(stopTakeover, TAKEOVER_TTL_MS), procs: [vnc, ws] };
+    const onExit = (name) => (code, sig) => { console.log("🖥️ 接管子进程退出:", name, "code=", code, "signal=", sig, takeoverStopping ? "(主动停止)" : "(意外)"); if (takeover && !takeoverStopping) stopTakeover(); };
+    vnc.on("exit", onExit("x11vnc")); ws.on("exit", onExit("websockify"));
+    vnc.on("error", (e) => console.error("x11vnc error:", e.message));
+    ws.on("error", (e) => console.error("websockify error:", e.message));
+    await new Promise((r) => setTimeout(r, 1500));
+    if (!takeover || vnc.exitCode !== null || ws.exitCode !== null) { stopTakeover(); throw new Error("接管进程启动失败"); }
+    const url = "https://d.qiyue.win/v170/vnc.html?autoconnect=true&resize=scale&path=v170/websockify&password=" + password;
+    console.log("🖥️ 接管已开启, 过期时间:", new Date(expiresAt).toISOString());
+    res.json({ ok: true, url, expiresAt: new Date(expiresAt).toISOString() });
+  } catch (e) {
+    stopTakeover();
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/takeover/stop", (req, res) => {
+  const was = !!takeover;
+  stopTakeover();
+  res.json({ ok: true, stopped: was });
+});
+
+app.get("/takeover/status", (req, res) => {
+  res.json({ ok: true, active: !!takeover, expiresAt: takeover ? new Date(takeover.expiresAt).toISOString() : null });
+});
+
+process.on("exit", () => { try { stopTakeover(); } catch (_) {} });
 
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`🔍 Browser Agent v6 已启动: http://127.0.0.1:${PORT}`);
