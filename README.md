@@ -2,7 +2,7 @@
 
 > 把一台真实 Chrome 包装成 HTTP API，给 AI Agent 和自动化脚本用。
 
-**v1.0.0** · 92 个接口 · 全部逐个实测
+**v1.0.1** · 92 个接口 · 全部逐个实测
 
 [English →](README.en.md)
 
@@ -16,7 +16,7 @@ AI Agent 抓网页时，`curl` / `wget` 只能拿到 HTML 骨架：JS 渲染的�
 
 Agent 用 HTTP 调它，就像人用手点。不是 headless 指纹伪造，是真的在用 Chrome。
 
-## 本版内容（v1.0.0）
+## 本版内容（v1.0.1）
 
 **新增网页爬取**
 

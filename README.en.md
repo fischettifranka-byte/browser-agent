@@ -2,7 +2,7 @@
 
 > A real Chrome browser, exposed as an HTTP API for AI agents and automation scripts.
 
-**v1.0.0** · 92 endpoints · every one tested individually
+**v1.0.1** · 92 endpoints · every one tested individually
 
 [中文说明 →](README.md)
 
@@ -16,7 +16,7 @@ When an AI agent scrapes the web with `curl` / `wget`, it only gets the HTML ske
 
 Agents call it over HTTP, exactly like a human clicking. This is not fingerprint spoofing — it is actually driving Chrome.
 
-## What's in v1.0.0
+## What's in v1.0.1
 
 **New: web scraping**
 

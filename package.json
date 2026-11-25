@@ -1,6 +1,6 @@
 {
   "name": "browser-agent",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "🔍 AI 手机浏览器操控工具 — HTTP API 驱动 headless Chromium，给 AI Agent 用的 Puppeteer 替代品",
   "main": "server.js",
   "bin": {
