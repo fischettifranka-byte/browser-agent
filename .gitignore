@@ -6,3 +6,7 @@ downloads/*
 .env
 .DS_Store
 cron-jobs.json
+
+# 发布产物 / 旧备份
+*.bak-*
+server.js.bak-v6
