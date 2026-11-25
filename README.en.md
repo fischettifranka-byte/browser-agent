@@ -39,6 +39,22 @@ When automation hits something it cannot pass — a login, a captcha, a consent 
 
 Also fixed: when the service started through its "restore existing pages" path, the default page did not get the shared UA and viewport settings.
 
+### Fix verification (2026-11-25, re-tested on a live instance)
+
+Not a claim — each endpoint was called after a service restart:
+
+| Endpoint | How it was tested | Result |
+|---|---|---|
+| `/structure` | page containing `<svg><circle>`, then read the tree | ✅ returned `body > [h1, svg > circle, form, div…]`, no crash |
+| `/watch` | 5s watch, mutated an `h1` via `/eval` mid-window | ✅ `changes:[{type:"childList", addedNodes:1, removedNodes:1}]`, `count:1` |
+| `/paginate` | two local HTML pages, `nextSelector:.next` | ✅ `totalPages:2`, page 2 items extracted after full navigation |
+| `/batch` | `[{status, method:GET}, {info}]` mixed | ✅ both `200`: GET sub-call 200, POST sub-call `ok:true`, no 401 |
+| `/submit` | GET form posting to `result.html?q=hello` | ✅ `ok:true` with the post-navigation URL, no 500 |
+
+Default page UA / viewport checked too: `Chrome/158.0.8127.88` (Windows x64), `1536×864`, `lang:zh-CN` — the restore path uses the same settings.
+
+> Environment: Ubuntu 24.04 + Chrome stable + Node v22.23.5, `systemd`-managed, `--proxy socks5://127.0.0.1:1080`.
+
 ## Anti-bot results (measured)
 
 Full pre-release run with a real browser and a residential egress:
@@ -337,6 +353,14 @@ curl -X POST :9223/batch -d '{"operations":[
 - **Global guards**: uncaught errors never take the service down
 - **Serialized page operations**: per-page queue, no concurrent stomping
 - **Crawl throttling**: max 2 concurrent `/crawl` jobs, 70s per-page timeout
+
+## Security & scope (read before deploying)
+
+- **Auth is off by default**: without `BA_TOKEN` there is no authentication at all. Never expose it naked on the public internet — set a token, or bind it to `127.0.0.1` and put an authenticated reverse proxy in front
+- **Session state is plaintext**: `chrome-profile/` holds cookies and logged-in sessions, i.e. account credentials. Tighten permissions (`chmod 700`), never ship it in an archive or share it
+- **Single port, single browser instance**: port 9223 is fixed and one Chromium is shared globally. The 8-tab cap and serialization queue make concurrency safe, not scalable
+- **Platform terms are your responsibility**: passing a bot check is not permission to automate. Most platforms forbid automated access in their terms, and accounts can be rate-limited or banned — that risk is the operator's
+- **Takeover links are temporary credentials**: the link returned by `/takeover/start` carries a one-time password and expires in 15 minutes; don't post it publicly
 
 ## Known limitations
 
